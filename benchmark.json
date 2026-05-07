@@ -1,0 +1,59 @@
+{
+  "bytes_read": 785420364,
+  "completed_requests": 4893,
+  "concurrency": 8,
+  "duration_s": 20.0,
+  "failed_requests": 0,
+  "latency_ms_avg": 32.810522841635866,
+  "latency_ms_p50": 18.395239996607415,
+  "latency_ms_p95": 78.63749399257358,
+  "latency_ms_p99": 115.3761679888703,
+  "plan": [
+    {
+      "path": "/cpu?iters=20000",
+      "weight": 2
+    },
+    {
+      "path": "/cpu?iters=120000",
+      "weight": 1
+    },
+    {
+      "path": "/json?items=128",
+      "weight": 2
+    },
+    {
+      "path": "/json?items=4096",
+      "weight": 1
+    },
+    {
+      "path": "/compress?kb=64",
+      "weight": 2
+    },
+    {
+      "path": "/compress?kb=1024",
+      "weight": 1
+    },
+    {
+      "path": "/file?kb=64",
+      "weight": 2
+    },
+    {
+      "path": "/file?kb=2048",
+      "weight": 1
+    },
+    {
+      "path": "/post?kb=32",
+      "weight": 2
+    },
+    {
+      "path": "/post?kb=512",
+      "weight": 1
+    }
+  ],
+  "requests_per_second": 244.65,
+  "status_codes": {
+    "200": 3911,
+    "404": 982
+  },
+  "url": "http://127.0.0.1:8080/"
+}

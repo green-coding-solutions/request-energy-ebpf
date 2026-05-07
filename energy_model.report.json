@@ -1,0 +1,27 @@
+{
+  "coefficients": {
+    "cache_miss_weight_uj_per_count": 0.0,
+    "cycles_weight_uj_per_count": 0.01047990904243213,
+    "default_multiplier": 0.0,
+    "freq_runtime_uj_per_ns": {},
+    "instructions_weight_uj_per_count": 0.0,
+    "migration_penalty_uj": 13872.272538426561,
+    "wakeup_penalty_uj": 0.0
+  },
+  "input_csv": "./samples.csv",
+  "target_column": "active_psys_uj",
+  "test_rows": {
+    "mae_uj": 113001775.17064664,
+    "mape_pct": 251.04735428230808,
+    "r2": -49995.80732424223,
+    "rmse_uj": 122951513.90716824,
+    "rows": 5
+  },
+  "train_rows": {
+    "mae_uj": 135742950.59914032,
+    "mape_pct": 299.6561183285487,
+    "r2": -43803.546868190446,
+    "rmse_uj": 139522110.65894037,
+    "rows": 16
+  }
+}
