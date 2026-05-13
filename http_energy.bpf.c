@@ -667,6 +667,16 @@ int BPF_PROG(bind_request_owner, struct sock *sk, struct msghdr *msg, size_t len
     req->owner_tid = tid;
     req->owner_tgid = tgid;
     bpf_map_update_elem(&thread_reqs, &tid, req_id, BPF_ANY);
+
+    /* Many requests finish inside a single scheduling slice, so the
+     * sched_switch sched-in path never sets last_sched_in_ns for them.
+     * Seed it here so finalize_request_energy / account_sched_out has a
+     * valid baseline to compute counter and runtime deltas from. */
+    if (!req->last_sched_in_ns) {
+        req->last_sched_in_ns = bpf_ktime_get_ns();
+        snapshot_request_counters(req);
+        req->sched_in_count += 1;
+    }
     return 0;
 }
 
