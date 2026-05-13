@@ -1846,6 +1846,27 @@ int main(int argc, char **argv)
 
     ret = 0;
 
+    /* Dump inject_energy_header diagnostic counters. */
+    {
+        static const char *labels[16] = {
+            "INVOKE", "NO_KEY", "NO_COOKIE", "NO_STATE",
+            "NO_REQID", "REQ_MISSING", "PULL_EMPTY", "PULL_FAIL",
+            "DATA_EMPTY", "NOT_HTTP", "NO_CRLF", "PUSH_FAIL",
+            "REFRESH_FAIL", "REFRESH_BOUND", "WRITE_BOUND", "SUCCESS",
+        };
+        struct bpf_map *m_dbg = bpf_object__find_map_by_name(obj, "inject_debug");
+        if (m_dbg) {
+            int dbg_fd = bpf_map__fd(m_dbg);
+            fprintf(stderr, "\n=== inject_energy_header counters ===\n");
+            for (__u32 i = 0; i < 16; i++) {
+                __u64 v = 0;
+                if (bpf_map_lookup_elem(dbg_fd, &i, &v) == 0)
+                    fprintf(stderr, "  [%2u] %-14s %llu\n", i, labels[i],
+                            (unsigned long long)v);
+            }
+        }
+    }
+
 cleanup:
     if (skmsg_attached)
         bpf_prog_detach2(skmsg_fd, sockhash_fd, BPF_SK_MSG_VERDICT);

@@ -139,6 +139,34 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 65536); __type(key
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1); __type(key, __u32); __type(value, struct psys_reading); } psys_last_reading SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1); __type(key, __u32); __type(value, struct psys_split_state); } psys_split_state SEC(".maps");
 
+/* Diagnostic counters for inject_energy_header. Slot indices below. */
+#define INJ_DBG_SLOTS 16
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, INJ_DBG_SLOTS); __type(key, __u32); __type(value, __u64); } inject_debug SEC(".maps");
+
+#define INJ_INVOKE          0
+#define INJ_NO_KEY          1
+#define INJ_NO_COOKIE       2
+#define INJ_NO_STATE        3
+#define INJ_NO_REQID        4
+#define INJ_REQ_MISSING     5
+#define INJ_PULL_EMPTY      6
+#define INJ_PULL_FAIL       7
+#define INJ_DATA_EMPTY      8
+#define INJ_NOT_HTTP        9
+#define INJ_NO_CRLF        10
+#define INJ_PUSH_FAIL      11
+#define INJ_REFRESH_FAIL   12
+#define INJ_REFRESH_BOUND  13
+#define INJ_WRITE_BOUND    14
+#define INJ_SUCCESS        15
+
+static __always_inline void inj_dbg(__u32 slot)
+{
+    __u64 *v = bpf_map_lookup_elem(&inject_debug, &slot);
+    if (v)
+        __sync_fetch_and_add(v, 1);
+}
+
 static __always_inline int fill_key4_sockops(struct bpf_sock_ops *skops, struct sock_key4 *key)
 {
     if (skops->family != AF_INET) return -1;
@@ -647,14 +675,44 @@ int BPF_PROG(bind_request_owner, struct sock *sk, struct msghdr *msg, size_t len
     if (!cookie)
         return 0;
 
-    __u64 *req_id = bpf_map_lookup_elem(&active_reqs, &cookie);
-    if (!req_id)
-        return 0;
-
-    struct request_state *req = bpf_map_lookup_elem(&reqs, req_id);
-    if (!req) {
-        bpf_map_delete_elem(&active_reqs, &cookie);
-        return 0;
+    /* Fallback: if track_ingress did not register a request for this
+     * connection (cgroup-skb ingress race or HTTP boundary missed), we
+     * still know a request exists because the server just read bytes
+     * from the socket. Synthesise the request here so sk_msg has the
+     * state it needs to inject the response header. */
+    __u64 *req_id_p = bpf_map_lookup_elem(&active_reqs, &cookie);
+    __u64 req_id;
+    struct request_state *req;
+    if (req_id_p) {
+        req_id = *req_id_p;
+        req = bpf_map_lookup_elem(&reqs, &req_id);
+        if (!req) {
+            bpf_map_delete_elem(&active_reqs, &cookie);
+            return 0;
+        }
+    } else {
+        struct conn_state *st = bpf_map_lookup_elem(&conns, &cookie);
+        if (!st)
+            return 0;
+        req_id = next_request_id();
+        if (req_id == 0)
+            return 0;
+        struct request_state init = {};
+        init.start_ns = bpf_ktime_get_ns();
+        init.sock_cookie = cookie;
+        if (bpf_map_update_elem(&reqs, &req_id, &init, BPF_ANY) != 0)
+            return 0;
+        if (bpf_map_update_elem(&active_reqs, &cookie, &req_id, BPF_ANY) != 0) {
+            bpf_map_delete_elem(&reqs, &req_id);
+            return 0;
+        }
+        st->current_req_id = req_id;
+        if (st->req_start_ns == 0)
+            st->req_start_ns = init.start_ns;
+        st->awaiting_resp = 1;
+        req = bpf_map_lookup_elem(&reqs, &req_id);
+        if (!req)
+            return 0;
     }
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -666,7 +724,7 @@ int BPF_PROG(bind_request_owner, struct sock *sk, struct msghdr *msg, size_t len
 
     req->owner_tid = tid;
     req->owner_tgid = tgid;
-    bpf_map_update_elem(&thread_reqs, &tid, req_id, BPF_ANY);
+    bpf_map_update_elem(&thread_reqs, &tid, &req_id, BPF_ANY);
 
     /* Many requests finish inside a single scheduling slice, so the
      * sched_switch sched-in path never sets last_sched_in_ns for them.
@@ -762,41 +820,61 @@ int inject_energy_header(struct sk_msg_md *msg)
     __u32 len;
     int insert_off = -1;
 
-    if (fill_key4_msg(msg, &key) != 0)
+    inj_dbg(INJ_INVOKE);
+
+    if (fill_key4_msg(msg, &key) != 0) {
+        inj_dbg(INJ_NO_KEY);
         return SK_PASS;
+    }
     __u64 *cookie = bpf_map_lookup_elem(&tuple_cookie, &key);
-    if (!cookie)
+    if (!cookie) {
+        inj_dbg(INJ_NO_COOKIE);
         return SK_PASS;
+    }
     cookie_val = *cookie;
 
     struct conn_state *st = bpf_map_lookup_elem(&conns, cookie);
-    if (!st || !st->awaiting_resp || st->req_start_ns == 0)
+    if (!st || !st->awaiting_resp || st->req_start_ns == 0) {
+        inj_dbg(INJ_NO_STATE);
         return SK_PASS;
+    }
     __u64 req_id = st->current_req_id;
-    if (req_id == 0)
+    if (req_id == 0) {
+        inj_dbg(INJ_NO_REQID);
         return SK_PASS;
+    }
     have_request = true;
 
     struct request_state *req = bpf_map_lookup_elem(&reqs, &req_id);
-    if (!req)
+    if (!req) {
+        inj_dbg(INJ_REQ_MISSING);
         goto out_finish;
+    }
 
     __u32 pull_len = msg->size;
     if (pull_len > SCAN_MAX_BYTES)
         pull_len = SCAN_MAX_BYTES;
-    if (pull_len == 0)
+    if (pull_len == 0) {
+        inj_dbg(INJ_PULL_EMPTY);
         goto out_finish;
-    if (bpf_msg_pull_data(msg, 0, pull_len, 0) != 0)
+    }
+    if (bpf_msg_pull_data(msg, 0, pull_len, 0) != 0) {
+        inj_dbg(INJ_PULL_FAIL);
         goto out_finish;
+    }
 
     data = (char *)(long)msg->data;
     data_end = (char *)(long)msg->data_end;
-    if (data >= data_end)
+    if (data >= data_end) {
+        inj_dbg(INJ_DATA_EMPTY);
         goto out_finish;
+    }
     len = (__u32)((void *)data_end - (void *)data);
     if (len > pull_len) len = pull_len;
-    if (!looks_like_http_response(data, data_end, len))
+    if (!looks_like_http_response(data, data_end, len)) {
+        inj_dbg(INJ_NOT_HTTP);
         goto out_finish;
+    }
 
 #pragma clang loop unroll(disable)
     for (int i = 0; i < SCAN_LOOP_MAX; i++) {
@@ -809,8 +887,10 @@ int inject_energy_header(struct sk_msg_md *msg)
             break;
         }
     }
-    if (insert_off < 0)
+    if (insert_off < 0) {
+        inj_dbg(INJ_NO_CRLF);
         goto out_finish;
+    }
 
     /* sk_msg programs are not allowed to call bpf_perf_event_read{,_value}.
      * The current request slice was already accounted in fentry/tcp_sendmsg
@@ -834,23 +914,32 @@ int inject_energy_header(struct sk_msg_md *msg)
         }
     }
 
-    if (bpf_msg_push_data(msg, insert_off, HDR_LEN, 0) != 0)
+    if (bpf_msg_push_data(msg, insert_off, HDR_LEN, 0) != 0) {
+        inj_dbg(INJ_PUSH_FAIL);
         goto out_finish;
+    }
 
     // refresh pointers
-    if (bpf_msg_pull_data(msg, 0, insert_off + HDR_LEN, 0) != 0)
+    if (bpf_msg_pull_data(msg, 0, insert_off + HDR_LEN, 0) != 0) {
+        inj_dbg(INJ_REFRESH_FAIL);
         goto out_finish;
+    }
     data = (char *)(long)msg->data;
     data_end = (char *)(long)msg->data_end;
-    if (data + insert_off + HDR_LEN > data_end)
+    if (data + insert_off + HDR_LEN > data_end) {
+        inj_dbg(INJ_REFRESH_BOUND);
         goto out_finish;
+    }
 
 #pragma clang loop unroll(disable)
     for (int i = 0; i < HDR_LEN; i++) {
-        if (data + insert_off + i + 1 > data_end)
+        if (data + insert_off + i + 1 > data_end) {
+            inj_dbg(INJ_WRITE_BOUND);
             goto out_finish;
+        }
         *(volatile char *)(data + insert_off + i) = hdr[i];
     }
+    inj_dbg(INJ_SUCCESS);
 
 out_finish:
     if (have_request)
