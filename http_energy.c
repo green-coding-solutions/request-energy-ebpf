@@ -1516,6 +1516,7 @@ int main(int argc, char **argv)
     struct collection_options collection = {};
     struct bpf_object *obj = NULL;
     struct bpf_link *recvmsg_link = NULL;
+    struct bpf_link *sendmsg_link = NULL;
     struct bpf_link *sched_link = NULL;
     struct bpf_link *freq_link = NULL;
     struct bpf_link *wakeup_link = NULL;
@@ -1591,6 +1592,7 @@ int main(int argc, char **argv)
     struct bpf_program *p_sockops = bpf_object__find_program_by_name(obj, "sockops_add_to_sockhash");
     struct bpf_program *p_ingress = bpf_object__find_program_by_name(obj, "track_ingress");
     struct bpf_program *p_recvmsg = bpf_object__find_program_by_name(obj, "bind_request_owner");
+    struct bpf_program *p_sendmsg = bpf_object__find_program_by_name(obj, "finalize_request_energy");
     struct bpf_program *p_sched   = bpf_object__find_program_by_name(obj, "account_sched_switch");
     struct bpf_program *p_freq    = bpf_object__find_program_by_name(obj, "track_cpu_frequency");
     struct bpf_program *p_wakeup  = bpf_object__find_program_by_name(obj, "track_sched_wakeup");
@@ -1598,7 +1600,7 @@ int main(int argc, char **argv)
     struct bpf_program *p_migrate = bpf_object__find_program_by_name(obj, "track_sched_migrate_task");
     struct bpf_program *p_skmsg   = bpf_object__find_program_by_name(obj, "inject_energy_header");
 
-    if (!p_sockops || !p_ingress || !p_recvmsg || !p_sched || !p_freq ||
+    if (!p_sockops || !p_ingress || !p_recvmsg || !p_sendmsg || !p_sched || !p_freq ||
         !p_wakeup || !p_wakeup_new || !p_migrate || !p_skmsg) {
         fprintf(stderr, "Failed to find one or more programs in object\n");
         goto cleanup;
@@ -1730,6 +1732,13 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    sendmsg_link = bpf_program__attach(p_sendmsg);
+    if (libbpf_get_error(sendmsg_link)) {
+        fprintf(stderr, "attach(fentry tcp_bpf_sendmsg) failed\n");
+        sendmsg_link = NULL;
+        goto cleanup;
+    }
+
     sched_link = bpf_program__attach(p_sched);
     if (libbpf_get_error(sched_link)) {
         fprintf(stderr, "attach(tracepoint sched_switch) failed\n");
@@ -1852,6 +1861,8 @@ cleanup:
         bpf_link__destroy(sched_link);
     if (recvmsg_link)
         bpf_link__destroy(recvmsg_link);
+    if (sendmsg_link)
+        bpf_link__destroy(sendmsg_link);
     if (ingress_attached)
         bpf_prog_detach2(ingress_fd, cg_fd, BPF_CGROUP_INET_INGRESS);
     if (sockops_attached)

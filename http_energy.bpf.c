@@ -615,7 +615,9 @@ int track_ingress(struct __sk_buff *skb)
                 struct request_state req = {};
                 req.start_ns = start_ns;
                 req.sock_cookie = cookie;
-                sample_psys_energy();
+                /* sample_psys_energy() removed: bpf_perf_event_read_value
+                 * is not permitted in cgroup_skb programs. PSYS is sampled
+                 * from userspace and from the fentry/tcp_sendmsg hook. */
                 if (bpf_map_update_elem(&reqs, &req_id, &req, BPF_ANY) != 0)
                     break;
                 if (bpf_map_update_elem(&active_reqs, &cookie, &req_id, BPF_ANY) != 0) {
@@ -665,6 +667,41 @@ int BPF_PROG(bind_request_owner, struct sock *sk, struct msghdr *msg, size_t len
     req->owner_tid = tid;
     req->owner_tgid = tgid;
     bpf_map_update_elem(&thread_reqs, &tid, req_id, BPF_ANY);
+    return 0;
+}
+
+/* Finalise the request's current scheduling slice from a context that is
+ * permitted to call bpf_perf_event_read{,_value}. fentry/tcp_bpf_sendmsg
+ * fires when the kernel enters the sockmap send path, which is BEFORE the
+ * sk_msg verdict program (inject_energy_header) runs on the outgoing
+ * response bytes. So req->energy_uj is up to date by the time the header
+ * is built. (Plain tcp_sendmsg is called by tcp_bpf_sendmsg *after* the
+ * verdict, so attaching there would be too late.) */
+SEC("fentry/tcp_bpf_sendmsg")
+int BPF_PROG(finalize_request_energy, struct sock *sk, struct msghdr *msg, size_t size)
+{
+    if (!sk)
+        return 0;
+
+    __u64 cookie = bpf_get_socket_cookie(sk);
+    if (!cookie)
+        return 0;
+
+    __u64 *req_id = bpf_map_lookup_elem(&active_reqs, &cookie);
+    if (!req_id)
+        return 0;
+
+    struct request_state *req = bpf_map_lookup_elem(&reqs, req_id);
+    if (!req)
+        return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tid = (__u32)pid_tgid;
+    __u64 now_ns = bpf_ktime_get_ns();
+
+    if (req->owner_tid == tid)
+        account_sched_out(req, tid, now_ns);
+    sample_psys_energy();
     return 0;
 }
 
@@ -765,12 +802,10 @@ int inject_energy_header(struct sk_msg_md *msg)
     if (insert_off < 0)
         goto out_finish;
 
-    __u64 now_ns = bpf_ktime_get_ns();
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tid = (__u32)pid_tgid;
-    if (req->owner_tid == tid)
-        account_sched_out(req, tid, now_ns);
-    sample_psys_energy();
+    /* sk_msg programs are not allowed to call bpf_perf_event_read{,_value}.
+     * The current request slice was already accounted in fentry/tcp_sendmsg
+     * (finalize_request_energy), so we only need to convert any pending
+     * PSYS score into microjoules here. */
     flush_pending_request_energy(req);
 
     __u64 energy_uj = req->energy_uj;
