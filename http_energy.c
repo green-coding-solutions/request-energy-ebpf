@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -35,6 +36,7 @@ struct energy_model_config {
     __u64 instructions_weight;
     __u64 cache_miss_weight;
     __u64 migration_penalty;
+    __u32 freq_bin_khz;
 };
 
 struct runtime_model_config {
@@ -513,11 +515,18 @@ static __u64 scale_weighted_score(__u64 value, __u64 weight)
 
 static __u64 freq_multiplier_for_khz(const struct loaded_energy_model *model, __u32 cpu_khz)
 {
+    __u32 lookup_khz = cpu_khz;
+
     if (!model)
         return ENERGY_MODEL_SCALE;
 
+    if (model->bpf_cfg.freq_bin_khz && cpu_khz) {
+        __u64 bin = model->bpf_cfg.freq_bin_khz;
+        lookup_khz = (__u32)((((__u64)cpu_khz + bin / 2) / bin) * bin);
+    }
+
     for (size_t i = 0; i < model->freq_count; i++) {
-        if (model->freq_entries[i].khz == cpu_khz)
+        if (model->freq_entries[i].khz == lookup_khz)
             return model->freq_entries[i].multiplier;
     }
 
@@ -1145,6 +1154,7 @@ static int load_energy_model_config(const char *path, int model_cfg_fd, int freq
             .instructions_weight = 0,
             .cache_miss_weight = 0,
             .migration_penalty = 0,
+            .freq_bin_khz = 0,
         },
         .runtime_cfg = {
             .idle_power_uw = 0,
@@ -1253,6 +1263,17 @@ static int load_energy_model_config(const char *path, int model_cfg_fd, int freq
                 goto out;
             }
             loaded.runtime_cfg.psys_interval_ms = (__u32)interval_ms;
+            continue;
+        }
+
+        if (strncmp(cursor, "freq_bin_khz=", 13) == 0) {
+            __u64 freq_bin_khz;
+
+            if (parse_u64_value(cursor + 13, &freq_bin_khz) != 0 || freq_bin_khz > UINT32_MAX) {
+                fprintf(stderr, "Invalid freq_bin_khz at %s:%d\n", path, line_no);
+                goto out;
+            }
+            loaded.bpf_cfg.freq_bin_khz = (__u32)freq_bin_khz;
             continue;
         }
 

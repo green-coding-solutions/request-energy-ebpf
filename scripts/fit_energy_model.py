@@ -19,13 +19,22 @@ def parse_args():
                         help="Energy target used for fitting.")
     parser.add_argument("--train-fraction", type=float, default=0.8, help="Fraction of rows used for training.")
     parser.add_argument("--seed", type=int, default=7, help="Deterministic split seed.")
-    parser.add_argument("--ridge", type=float, default=1e-9, help="Ridge regularization added to X^T X.")
+    parser.add_argument("--ridge", type=float, default=1.0,
+                        help="Ridge regularization added to normalized X^T X.")
+    parser.add_argument("--freq-bin-khz", type=int, default=100000,
+                        help="Round CPU frequencies to this kHz bucket before fitting; use 0 for exact keys.")
     parser.add_argument("--psys-interval-ms", type=int, default=200,
                         help="psys_interval_ms written into the generated config.")
     return parser.parse_args()
 
 
-def parse_freq_runtime(text):
+def bucket_freq_khz(khz, freq_bin_khz):
+    if freq_bin_khz <= 0:
+        return khz
+    return ((khz + freq_bin_khz // 2) // freq_bin_khz) * freq_bin_khz
+
+
+def parse_freq_runtime(text, freq_bin_khz):
     runtimes = {}
     text = (text or "").strip()
     if not text:
@@ -35,14 +44,14 @@ def parse_freq_runtime(text):
         if not chunk:
             continue
         khz_text, runtime_text = chunk.split(":", 1)
-        khz = int(khz_text)
+        khz = bucket_freq_khz(int(khz_text), freq_bin_khz)
         runtime_ns = float(runtime_text)
         runtimes[khz] = runtimes.get(khz, 0.0) + runtime_ns
 
     return runtimes
 
 
-def load_rows(path, target_column):
+def load_rows(path, target_column, freq_bin_khz):
     rows = []
     freq_keys = set()
 
@@ -50,7 +59,7 @@ def load_rows(path, target_column):
         reader = csv.DictReader(fp)
         for row in reader:
             target = float(row[target_column])
-            freq_runtime = parse_freq_runtime(row.get("freq_runtime_ns", ""))
+            freq_runtime = parse_freq_runtime(row.get("freq_runtime_ns", ""), freq_bin_khz)
             for khz in freq_runtime:
                 freq_keys.add(khz)
 
@@ -130,11 +139,25 @@ def solve_linear_system(matrix, rhs):
 
 def fit_ridge_regression(rows, freq_keys, ridge):
     feature_count = len(freq_keys) + 5
+    feature_scales = [0.0 for _ in range(feature_count)]
+
+    for row in rows:
+        features = row_to_features(row, freq_keys)
+        for i, value in enumerate(features):
+            feature_scales[i] += value * value
+
+    for i, value in enumerate(feature_scales):
+        scale = math.sqrt(value / len(rows)) if rows else 0.0
+        feature_scales[i] = scale if scale > 0.0 else 1.0
+
     xtx = [[0.0 for _ in range(feature_count)] for _ in range(feature_count)]
     xty = [0.0 for _ in range(feature_count)]
 
     for row in rows:
-        features = row_to_features(row, freq_keys)
+        features = [
+            value / feature_scales[i]
+            for i, value in enumerate(row_to_features(row, freq_keys))
+        ]
         target = row["target"]
 
         for i in range(feature_count):
@@ -146,7 +169,7 @@ def fit_ridge_regression(rows, freq_keys, ridge):
         xtx[i][i] += ridge
 
     coeffs = solve_linear_system(xtx, xty)
-    return [max(0.0, coeff) for coeff in coeffs]
+    return [max(0.0, coeff / feature_scales[i]) for i, coeff in enumerate(coeffs)]
 
 
 def predict(row, freq_keys, coeffs):
@@ -207,7 +230,7 @@ def runtime_weighted_average(freq_keys, coeffs, rows):
     return total_weighted / total_runtime
 
 
-def write_config(path, freq_keys, coeffs, default_runtime_coeff, psys_interval_ms):
+def write_config(path, freq_keys, coeffs, default_runtime_coeff, psys_interval_ms, freq_bin_khz):
     wakeup_coeff = coeffs[len(freq_keys)]
     cycles_coeff = coeffs[len(freq_keys) + 1]
     instructions_coeff = coeffs[len(freq_keys) + 2]
@@ -227,6 +250,7 @@ def write_config(path, freq_keys, coeffs, default_runtime_coeff, psys_interval_m
         f"migration_penalty={int(round(migration_coeff))}",
         "idle_power_uw=0",
         f"psys_interval_ms={psys_interval_ms}",
+        f"freq_bin_khz={freq_bin_khz}",
     ]
 
     for idx, khz in enumerate(freq_keys):
@@ -239,7 +263,10 @@ def write_config(path, freq_keys, coeffs, default_runtime_coeff, psys_interval_m
 
 def main():
     args = parse_args()
-    rows, freq_keys = load_rows(args.input_csv, args.target_column)
+    if args.freq_bin_khz < 0:
+        raise SystemExit("--freq-bin-khz must be >= 0")
+
+    rows, freq_keys = load_rows(args.input_csv, args.target_column, args.freq_bin_khz)
     if len(rows) < 2:
         raise SystemExit("Need at least two collected intervals to fit and evaluate a model.")
 
@@ -253,6 +280,7 @@ def main():
     report = {
         "input_csv": args.input_csv,
         "target_column": args.target_column,
+        "freq_bin_khz": args.freq_bin_khz,
         "train_rows": train_metrics,
         "test_rows": test_metrics,
         "coefficients": {
@@ -268,7 +296,8 @@ def main():
         },
     }
 
-    write_config(args.output_config, freq_keys, coeffs, default_runtime_coeff, args.psys_interval_ms)
+    write_config(args.output_config, freq_keys, coeffs, default_runtime_coeff,
+                 args.psys_interval_ms, args.freq_bin_khz)
     if args.report_json:
         with open(args.report_json, "w", encoding="utf-8") as fp:
             json.dump(report, fp, indent=2, sort_keys=True)

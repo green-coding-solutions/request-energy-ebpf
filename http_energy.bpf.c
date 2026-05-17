@@ -85,6 +85,7 @@ struct energy_model_config {
     __u64 instructions_weight;
     __u64 cache_miss_weight;
     __u64 migration_penalty;
+    __u32 freq_bin_khz;
 };
 
 struct psys_reading {
@@ -331,9 +332,15 @@ static __always_inline __u64 freq_multiplier_for_khz(__u32 cpu_khz)
 {
     struct energy_model_config *cfg = get_model_config();
     __u64 multiplier = cfg ? cfg->default_freq_multiplier : ENERGY_MODEL_SCALE;
+    __u32 lookup_khz = cpu_khz;
     __u64 *override;
 
-    override = bpf_map_lookup_elem(&freq_multipliers, &cpu_khz);
+    if (cfg && cfg->freq_bin_khz && cpu_khz) {
+        __u64 bin = cfg->freq_bin_khz;
+        lookup_khz = (__u32)((((__u64)cpu_khz + bin / 2) / bin) * bin);
+    }
+
+    override = bpf_map_lookup_elem(&freq_multipliers, &lookup_khz);
     if (override)
         multiplier = *override;
     return multiplier;

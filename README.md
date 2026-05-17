@@ -62,7 +62,7 @@ make clean
 
 ### Energy model config
 - `attribution_mode=psys|model` selects either live PSYS interval splitting or direct in-kernel model evaluation.
-- `default_multiplier=<float>` sets the fallback score multiplier when there is no exact `freq_khz` entry for the current CPU frequency.
+- `default_multiplier=<float>` sets the fallback score multiplier when there is no matching `freq_khz` entry for the current CPU frequency.
 - `wakeup_penalty=<integer>` adds that many score units whenever the request-owning thread triggers a scheduler wakeup.
 - `cycles_weight=<float>` adds `cycles * cycles_weight` to the score on each accounted slice.
 - `instructions_weight=<float>` adds `instructions * instructions_weight` to the score on each accounted slice.
@@ -70,7 +70,8 @@ make clean
 - `migration_penalty=<integer>` adds that many score units whenever the request-owning thread is migrated.
 - `idle_power_uw=<integer>` subtracts that idle baseline from each sampled PSYS interval before energy is distributed across processes.
 - `psys_interval_ms=<integer>` controls how often userspace samples PSYS and recomputes the live `uJ / score` factor.
-- `freq_khz=<khz> <float>` sets an exact-match multiplier for a specific CPU frequency in kHz.
+- `freq_bin_khz=<integer>` optionally rounds observed CPU frequencies to this kHz bucket size before matching `freq_khz` entries. Use `0` for exact matching.
+- `freq_khz=<khz> <float>` sets a multiplier for a specific CPU frequency in kHz after optional bucketing.
 - Float weights are fixed-point scalars with `1.0` meaning `delta += signal_value`, `2.0` meaning `delta += 2 * signal_value`, and so on.
 - In `psys` mode those deltas are intermediate score units that are converted to microjoules through the live PSYS split factor.
 - In `model` mode those deltas are interpreted directly as microjoules, so the fitted config coefficients must already be in energy units.
@@ -158,6 +159,7 @@ Fit the collected CSV against PSYS energy and emit a ready-to-use `energy_model.
 The fitter:
 - uses `active_psys_uj` as the default target
 - fits per-frequency runtime coefficients plus wakeup/cycle/instruction/cache-miss/migration coefficients
+- rounds CPU frequencies to 100 MHz buckets by default to avoid overfitting noisy `scaling_cur_freq` readings
 - writes evaluation metrics for train/test splits (`MAE`, `RMSE`, `MAPE`, `R²`)
 - generates a config with `attribution_mode=model`
 - writes `psys_interval_ms=200` by default in the generated config
