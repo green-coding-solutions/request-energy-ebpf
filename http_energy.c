@@ -1491,11 +1491,18 @@ static int run_psys_split_update(const struct loaded_energy_model *model,
 
     if (bpf_map_lookup_elem(psys_split_fd, &key, &split) != 0)
         memset(&split, 0, sizeof(split));
-    split.uj_per_score_scaled = uj_per_score_scaled;
-    split.interval_score = total_score;
-    split.interval_psys_uj = interval_psys_uj;
-    split.interval_active_psys_uj = active_psys_uj;
-    split.interval_idle_uj = idle_uj;
+    /* Only refresh the conversion ratio when the current interval actually
+     * produced one. If the cgroup was idle (total_score == 0) or PSYS showed
+     * no active energy above the idle baseline, keep the previous ratio so
+     * fast requests landing during a quiet gap still get a non-zero
+     * X-Energy-Score from the last known-good calibration. */
+    if (uj_per_score_scaled) {
+        split.uj_per_score_scaled = uj_per_score_scaled;
+        split.interval_score = total_score;
+        split.interval_psys_uj = interval_psys_uj;
+        split.interval_active_psys_uj = active_psys_uj;
+        split.interval_idle_uj = idle_uj;
+    }
     split.update_count += 1;
     if (bpf_map_update_elem(psys_split_fd, &key, &split, BPF_ANY) != 0)
         goto out;
